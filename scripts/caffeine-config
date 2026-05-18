@@ -1,0 +1,119 @@
+#!/bin/bash
+# HyprCaffeine Config — Floating popup via Walker --dmenu
+# Replaces the old gum-based TUI that required a terminal window
+
+CONFIG_FILE="$HOME/.config/hypr/autostart.conf"
+
+read_state() {
+    hyprctl caffeine 2>/dev/null || echo '{}'
+}
+
+read_config() {
+    local key="$1"
+    grep -oP "plugin:hyprcaffeine:${key}\s*=\s*\K[0-9]+" "$CONFIG_FILE" 2>/dev/null | tail -1
+}
+
+write_config() {
+    local key="$1"
+    local value="$2"
+    if grep -q "plugin:hyprcaffeine:${key}" "$CONFIG_FILE" 2>/dev/null; then
+        sed -i "s|plugin:hyprcaffeine:${key}\s*=.*|plugin:hyprcaffeine:${key} = ${value}|" "$CONFIG_FILE"
+    else
+        sed -i "/hyprcaffeine2\.so/a plugin:hyprcaffeine:${key} = ${value}" "$CONFIG_FILE"
+    fi
+}
+
+toggle_config() {
+    local key="$1"
+    local label="$2"
+    local current
+    current=$(read_config "$key")
+    if [[ $current == "1" ]]; then
+        write_config "$key" 0
+        notify-send -u low "󰛦 ${label} desativado"
+    else
+        write_config "$key" 1
+        notify-send -u low "󰛦 ${label} ativado"
+    fi
+}
+
+prompt_auto_off() {
+    local auto_off="$1"
+    local new_val
+    new_val=$(echo "" | walker --dmenu -p "Auto-desligar (seg, 0=manual)" --width 350 --minheight 1 --maxheight 200 2>/dev/null) || return
+
+    if [[ $new_val =~ ^[0-9]+$ ]]; then
+        write_config "auto_off_timeout" "$new_val"
+        notify-send -u low "󰛦 Auto-desligar: ${new_val}s"
+    fi
+}
+
+show_menu() {
+    local state
+    state=$(read_state)
+
+    local enabled sleep_inh scr_inh auto_off
+    enabled=$(echo "$state" | grep -oP '"enabled": \K[a-z]+')
+    sleep_inh=$(echo "$state" | grep -oP '"cfg_inhibit_sleep": \K[a-z]+')
+    scr_inh=$(echo "$state" | grep -oP '"cfg_inhibit_screensaver": \K[a-z]+')
+    auto_off=$(echo "$state" | grep -oP '"cfg_auto_off_timeout": \K[0-9]+')
+
+    local caffeine_label sleep_label scr_label auto_label
+
+    if [[ $enabled == "true" ]]; then
+        caffeine_label="󰛦 Caffeine: ATIVO"
+    else
+        caffeine_label="󰛦 Caffeine: Inativo"
+    fi
+
+    if [[ $sleep_inh == "true" ]]; then
+        sleep_label="󰒲 Inibir Suspensão: Sim"
+    else
+        sleep_label="󰒲 Inibir Suspensão: Não"
+    fi
+
+    if [[ $scr_inh == "true" ]]; then
+        scr_label="󱄄 Inibir Protetor de Tela: Sim"
+    else
+        scr_label="󱄄 Inibir Protetor de Tela: Não"
+    fi
+
+    if [[ ${auto_off:-0} -gt 0 ]]; then
+        local mins=$((auto_off / 60))
+        local secs=$((auto_off % 60))
+        if [[ $mins -gt 0 ]]; then
+            auto_label="󱎫 Auto-desligar: ${mins}min${secs:+ ${secs}s}"
+        else
+            auto_label="󱎫 Auto-desligar: ${auto_off}s"
+        fi
+    else
+        auto_label="󱎫 Auto-desligar: Manual"
+    fi
+
+    local choice
+    choice=$(echo -e "${caffeine_label}\n${sleep_label}\n${scr_label}\n${auto_label}\n󰑓 Recarregar Plugin" \
+        | walker --dmenu -p "󰛦 Caffeine" --width 340 --minheight 1 --maxheight 300 2>/dev/null) || return 0
+
+    case "$choice" in
+        *Caffeine*)
+            hyprctl dispatch caffeine toggle >/dev/null 2>&1
+            ;;
+        *Suspensão*)
+            toggle_config "inhibit_sleep" "Inibir Suspensão"
+            ;;
+        *Protetor*)
+            toggle_config "inhibit_screensaver" "Inibir Protetor de Tela"
+            ;;
+        *Auto-desligar*)
+            prompt_auto_off "${auto_off:-0}"
+            ;;
+        *Recarregar*)
+            hyprctl plugin unload /home/asm/.hyprplugins/hyprcaffeine/hyprcaffeine2.so 2>/dev/null
+            sleep 1
+            hyprctl plugin load /home/asm/.hyprplugins/hyprcaffeine/hyprcaffeine2.so 2>/dev/null
+            notify-send -u low "󰛦 Plugin recarregado"
+            ;;
+    esac
+}
+
+show_menu
