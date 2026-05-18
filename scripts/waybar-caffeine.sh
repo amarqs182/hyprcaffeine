@@ -1,13 +1,17 @@
 #!/bin/bash
 # Caffeine indicator for Waybar — permanent monochrome icon
 # Parses JSON from hyprctl caffeine (v2.0+)
+# Requires: hyprctl, jq (optional, falls back to grep)
 
 state=$(hyprctl caffeine 2>/dev/null)
 
-enabled="false"
-if [[ $state == {* ]]; then
-    # JSON output — parse enabled field
-    enabled=$(echo "$state" | grep -o '"enabled": [a-z]*' | head -1 | grep -o 'true')
+if command -v jq &>/dev/null; then
+    enabled=$(echo "$state" | jq -r '.enabled // false' 2>/dev/null)
+else
+    enabled="false"
+    if [[ $state == {* ]]; then
+        enabled=$(echo "$state" | grep -oP '"enabled":\s*\K[a-z]+' | head -1)
+    fi
 fi
 
 if [[ $enabled == "true" ]]; then

@@ -16,10 +16,15 @@ read_config() {
 write_config() {
     local key="$1"
     local value="$2"
+    # Sanitize inputs — only allow alphanumeric keys and numeric values
+    if [[ ! "$key" =~ ^[a-z_]+$ ]] || [[ ! "$value" =~ ^[0-9]+$ ]]; then
+        notify-send -u critical "HyprCaffeine" "Invalid config value"
+        return 1
+    fi
     if grep -q "plugin:hyprcaffeine:${key}" "$CONFIG_FILE" 2>/dev/null; then
         sed -i "s|plugin:hyprcaffeine:${key}\s*=.*|plugin:hyprcaffeine:${key} = ${value}|" "$CONFIG_FILE"
     else
-        sed -i "/hyprcaffeine2\.so/a plugin:hyprcaffeine:${key} = ${value}" "$CONFIG_FILE"
+        sed -i "/hyprcaffeine.*\.so/a plugin:hyprcaffeine:${key} = ${value}" "$CONFIG_FILE"
     fi
 }
 
@@ -38,7 +43,6 @@ toggle_config() {
 }
 
 prompt_auto_off() {
-    local auto_off="$1"
     local new_val
     new_val=$(echo "" | walker --dmenu -p "Auto-desligar (seg, 0=manual)" --width 350 --minheight 1 --maxheight 200 2>/dev/null) || return
 
@@ -53,10 +57,18 @@ show_menu() {
     state=$(read_state)
 
     local enabled sleep_inh scr_inh auto_off
-    enabled=$(echo "$state" | grep -oP '"enabled": \K[a-z]+')
-    sleep_inh=$(echo "$state" | grep -oP '"cfg_inhibit_sleep": \K[a-z]+')
-    scr_inh=$(echo "$state" | grep -oP '"cfg_inhibit_screensaver": \K[a-z]+')
-    auto_off=$(echo "$state" | grep -oP '"cfg_auto_off_timeout": \K[0-9]+')
+
+    if command -v jq &>/dev/null; then
+        enabled=$(echo "$state" | jq -r '.enabled // false' 2>/dev/null)
+        sleep_inh=$(echo "$state" | jq -r '.cfg_inhibit_sleep // true' 2>/dev/null)
+        scr_inh=$(echo "$state" | jq -r '.cfg_inhibit_screensaver // true' 2>/dev/null)
+        auto_off=$(echo "$state" | jq -r '.cfg_auto_off_timeout // 0' 2>/dev/null)
+    else
+        enabled=$(echo "$state" | grep -oP '"enabled":\s*\K[a-z]+')
+        sleep_inh=$(echo "$state" | grep -oP '"cfg_inhibit_sleep":\s*\K[a-z]+')
+        scr_inh=$(echo "$state" | grep -oP '"cfg_inhibit_screensaver":\s*\K[a-z]+')
+        auto_off=$(echo "$state" | grep -oP '"cfg_auto_off_timeout":\s*\K[0-9]+')
+    fi
 
     local caffeine_label sleep_label scr_label auto_label
 
@@ -105,12 +117,13 @@ show_menu() {
             toggle_config "inhibit_screensaver" "Inibir Protetor de Tela"
             ;;
         *Auto-desligar*)
-            prompt_auto_off "${auto_off:-0}"
+            prompt_auto_off
             ;;
         *Recarregar*)
-            hyprctl plugin unload /home/asm/.hyprplugins/hyprcaffeine/hyprcaffeine2.so 2>/dev/null
+            local plugin_dir="$HOME/.hyprplugins/hyprcaffeine"
+            hyprctl plugin unload "${plugin_dir}/hyprcaffeine2.so" 2>/dev/null
             sleep 1
-            hyprctl plugin load /home/asm/.hyprplugins/hyprcaffeine/hyprcaffeine2.so 2>/dev/null
+            hyprctl plugin load "${plugin_dir}/hyprcaffeine2.so" 2>/dev/null
             notify-send -u low "󰛦 Plugin recarregado"
             ;;
     esac

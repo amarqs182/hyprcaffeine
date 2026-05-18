@@ -6,7 +6,8 @@ Caffeine mode plugin for [Hyprland](https://hyprland.org) — inhibits idle noti
 
 - **Idle inhibition** — blocks Wayland `ext-idle-notify` protocol (prevents screen dimming/lock via hypridle)
 - **Sleep inhibition** — blocks system suspend/hibernate via systemd-logind D-Bus `Inhibit("sleep",...,"block")`
-- **Auto-off timer** — automatically disables caffeine after N seconds
+- **Independent controls** — `inhibit_screensaver` and `inhibit_sleep` work independently
+- **Auto-off timer** — automatically disables caffeine after N seconds (thread-based, no signal handler)
 - **hyprctl query** — `hyprctl caffeine` returns JSON state
 - **Hyprland notifications** — visual feedback on toggle
 - **Waybar integration** — persistent monochrome icon, click to toggle, right-click for config popup
@@ -14,9 +15,10 @@ Caffeine mode plugin for [Hyprland](https://hyprland.org) — inhibits idle noti
 
 ## Requirements
 
-- Hyprland 0.54+
+- Hyprland 0.40+
 - libsystemd (for sd-bus / logind inhibit)
 - walker (for `caffeine-config` popup menu)
+- jq (optional, for robust JSON parsing in scripts)
 
 ## Build
 
@@ -47,7 +49,7 @@ Add to your `hyprland.conf` or sourced config:
 ```ini
 plugin:hyprcaffeine:enabled = 0             # Enable on startup (default: 0)
 plugin:hyprcaffeine:inhibit_sleep = 1       # Inhibit system suspend (default: 1)
-plugin:hyprcaffeine:inhibit_screensaver = 1 # Inhibit screen saver (default: 1)
+plugin:hyprcaffeine:inhibit_screensaver = 1 # Inhibit screen saver / idle (default: 1)
 plugin:hyprcaffeine:auto_off_timeout = 0    # Auto-disable after N seconds (default: 0 = manual)
 ```
 
@@ -112,15 +114,19 @@ Add `"custom/caffeine"` to your modules list.
 ```bash
 #!/bin/bash
 state=$(hyprctl caffeine 2>/dev/null)
-enabled="false"
-if [[ $state == {* ]]; then
-    enabled=$(echo "$state" | grep -o '"enabled": [a-z]*' | head -1 | grep -o 'true')
+if command -v jq &>/dev/null; then
+    enabled=$(echo "$state" | jq -r '.enabled // false' 2>/dev/null)
+else
+    enabled="false"
+    if [[ $state == {* ]]; then
+        enabled=$(echo "$state" | grep -oP '"enabled":\s*\K[a-z]+' | head -1)
+    fi
 fi
 
 if [[ $enabled == "true" ]]; then
     echo '{"text": "󰛦", "tooltip": "Caffeine ON — idle/sleep/screensaver inhibited", "class": "active"}'
 else
-    echo '{"text": "󰛦", "tooltip": "Caffeine OFF — click to enable", "class": "inactive"}'
+    echo '{"text": "󰛦", "tooltip": "Caffeine OFF — clique para ativar", "class": "inactive"}'
 fi
 ```
 
@@ -139,13 +145,13 @@ fi
 }
 ```
 
-The 󰛦 icon is always visible in the bar — left click toggles, right click opens config popup.
+The icon is always visible in the bar — left click toggles, right click opens config popup.
 
 ### Window rules (for Walker popup)
 
 ```ini
-windowrule = float on, match:class walker
-windowrule = pin on, match:class walker
+windowrulev2 = float, class:^(walker)$
+windowrulev2 = pin, class:^(walker)$
 ```
 
 ## Architecture
@@ -154,17 +160,17 @@ windowrule = pin on, match:class walker
 |---|---|---|
 | Idle inhibit | `PROTO::idle->setInhibit()` | Blocks Wayland idle notifications |
 | Sleep inhibit | `sd_bus_call_method()` → logind `Inhibit("sleep",...,"block")` | Holds inhibit FD open = sleep blocked |
-| Auto-off timer | `alarm()` + `SIGALRM` | Disables after N seconds |
-| hyprctl query | `registerHyprCtlCommand()` → `SP<SHyprCtlCommand>` | Returns JSON state |
+| Auto-off timer | `std::thread` + `sleep_for` | Disables after N seconds (no signal handler) |
+| hyprctl query | `registerHyprCtlCommand()` → `SP<SHyprCtlCommand>` | Returns JSON state via `snprintf` |
 | Dispatcher | `addDispatcherV2()` | Toggle on/off/toggle |
-| Waybar signal | `pkill -RTMIN+11 waybar` | Forces module refresh |
+| Waybar signal | `/proc` scan + `kill(pid, SIGRTMIN+11)` | Forces module refresh (no fork) |
 
 ### Lifecycle
 
 1. **PLUGIN_INIT** — registers config values, dispatcher, hyprctl command; reads config; enables if `enabled=1`
-2. **setCaffeineEnabled(true)** — inhibits idle, acquires logind inhibit FD, sets alarm
-3. **setCaffeineEnabled(false)** — releases everything, notifies, signals waybar
-4. **PLUGIN_EXIT** — cleans state, **unregisters hyprctl command** (critical to prevent SEGV on unload)
+2. **setCaffeineEnabled(true)** — inhibits idle (if screensaver config on), acquires logind inhibit FD (if sleep config on), starts auto-off thread
+3. **setCaffeineEnabled(false)** — stops timer, releases everything, notifies, signals waybar
+4. **PLUGIN_EXIT** — stops timer, cleans state, **unregisters hyprctl command** (critical to prevent SEGV on unload)
 
 ## Troubleshooting
 
@@ -174,10 +180,10 @@ windowrule = pin on, match:class walker
 | `sleep_inhibited: false` despite `inhibit_sleep=1` | logind unavailable or no permission | Check `systemctl status systemd-logind` |
 | Waybar icon not updating | Signal not received | Run `pkill -RTMIN+11 waybar` manually; verify `signal: 11` in config |
 | Config popup opens empty terminal | Old script used gum (needs TTY) | v2.1+: uses Walker --dmenu floating popup |
-| Hyprland config errors on windowrules | Missing value after rule name | Correct format: `float on, match:class walker` (not `float, match:class walker`) |
 
 ## Version History
 
+- **2.2** — Fixed signal handler UB (thread-based timer), replaced system() with /proc scan + kill(), independent inhibit_screensaver control, snprintf JSON output, input validation in scripts, jq support, windowrulev2 syntax.
 - **2.1** — Fixed SEGV on unload: store `SP<SHyprCtlCommand>` and call `unregisterHyprCtlCommand()` in `PLUGIN_EXIT`. Added Walker --dmenu config popup.
 - **2.0** — Initial working version with idle/sleep inhibition, hyprctl query, auto-off timer.
 

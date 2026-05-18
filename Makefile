@@ -17,6 +17,9 @@ clean:
 	rm -f ./$(TARGET)
 
 install: $(TARGET)
-	install -Dm644 $(TARGET) ~/.hyprplugins/$(TARGET)
+	install -Dm644 $(TARGET) ~/.hyprplugins/hyprcaffeine/$(TARGET)
 
-.PHONY: all clean install
+uninstall:
+	rm -f ~/.hyprplugins/hyprcaffeine/$(TARGET)
+
+.PHONY: all clean install uninstall

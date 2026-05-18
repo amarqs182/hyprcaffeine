@@ -1,10 +1,15 @@
 #define WLR_USE_UNSTABLE
 
 #include <any>
+#include <atomic>
 #include <cstring>
 #include <string>
+#include <thread>
+#include <csignal>
 #include <unistd.h>
-#include <signal.h>
+#include <fcntl.h>
+#include <dirent.h>
+#include <cstdlib>
 #include <systemd/sd-bus.h>
 
 #include <hyprland/src/plugins/PluginAPI.hpp>
@@ -18,27 +23,31 @@ APICALL EXPORT std::string PLUGIN_API_VERSION() {
 static HANDLE PHANDLE = nullptr;
 
 /* ------------------------------------------------------------------ */
-/* Caffeine state */
+/* Caffeine state                                                     */
 /* ------------------------------------------------------------------ */
-static bool g_bCaffeineEnabled = false;
+static std::atomic<bool> g_bCaffeineEnabled{false};
 static int g_iInhibitFd = -1;
-static bool g_bSleepInhibitActive = false;
+static std::atomic<bool> g_bSleepInhibitActive{false};
 
 /* Config values */
 static bool g_cfgInhibitSleep = true;
 static bool g_cfgInhibitScreensaver = true;
 static int g_cfgAutoOffTimeout = 0;
 
-/* Registered hyprctl command handle — must be kept for proper unregister */
+/* Auto-off timer thread */
+static std::thread g_autoOffThread;
+static std::atomic<bool> g_bStopAutoOff{false};
+
+/* Registered hyprctl command handle */
 static SP<SHyprCtlCommand> g_pCaffeineCmd = nullptr;
 
 /* Forward declarations */
 static void setCaffeineEnabled(bool enabled);
 
 /* ------------------------------------------------------------------ */
-/* D-Bus sleep inhibition via systemd-logind */
-/* Uses sd_bus_open_system() for robustness. The inhibit FD is dup'd */
-/* and the bus is closed immediately — the FD stays valid independently.*/
+/* D-Bus sleep inhibition via systemd-logind                          */
+/* Uses sd_bus_open_system() for robustness. The inhibit FD is dup'd  */
+/* and the bus is closed immediately — the FD stays valid independently*/
 /* ------------------------------------------------------------------ */
 static bool acquireSleepInhibit() {
     if (g_iInhibitFd >= 0) {
@@ -109,7 +118,7 @@ static void releaseSleepInhibit() {
 }
 
 /* ------------------------------------------------------------------ */
-/* Idle inhibition (ext-idle-notify protocol) */
+/* Idle inhibition (ext-idle-notify protocol)                         */
 /* ------------------------------------------------------------------ */
 static void setIdleInhibit(bool inhibited) {
     if (PROTO::idle)
@@ -117,41 +126,95 @@ static void setIdleInhibit(bool inhibited) {
 }
 
 /* ------------------------------------------------------------------ */
-/* Auto-off timer (SIGALRM) */
+/* Signal waybar to refresh (async-signal-safe, no fork)              */
 /* ------------------------------------------------------------------ */
-static void onAutoOffAlarm(int sig) {
-    (void)sig;
-    if (g_bCaffeineEnabled) {
-        setCaffeineEnabled(false);
+static void signalWaybar() {
+    // Find waybar PIDs via /proc — no fork, no system()
+    // SIGRTMIN+11 is the signal waybar watches
+    DIR* proc = opendir("/proc");
+    if (!proc) return;
+
+    struct dirent* entry;
+    while ((entry = readdir(proc)) != nullptr) {
+        if (entry->d_type != DT_DIR) continue;
+        if (entry->d_name[0] < '0' || entry->d_name[0] > '9') continue;
+
+        // d_name max is 256, PIDs are <= 7 digits — use d_name size for safety
+        char comm_path[sizeof(entry->d_name) + 12];
+        snprintf(comm_path, sizeof(comm_path), "/proc/%s/comm", entry->d_name);
+
+        int fd = open(comm_path, O_RDONLY);
+        if (fd < 0) continue;
+
+        char comm[32] = {};
+        ssize_t n = read(fd, comm, sizeof(comm) - 1);
+        close(fd);
+        if (n <= 0) continue;
+
+        // Strip trailing newline
+        if (comm[n - 1] == '\n') comm[n - 1] = '\0';
+
+        if (strcmp(comm, "waybar") == 0) {
+            pid_t pid = (pid_t)atoi(entry->d_name);
+            if (pid > 0)
+                kill(pid, SIGRTMIN + 11);
+        }
     }
+    closedir(proc);
 }
 
 /* ------------------------------------------------------------------ */
-/* Toggle */
+/* Auto-off timer (thread-based, no signal handler)                   */
+/* ------------------------------------------------------------------ */
+static void startAutoOffTimer() {
+    // Cancel any existing timer
+    g_bStopAutoOff = true;
+    if (g_autoOffThread.joinable())
+        g_autoOffThread.join();
+    g_bStopAutoOff = false;
+
+    if (g_cfgAutoOffTimeout <= 0) return;
+
+    g_autoOffThread = std::thread([]() {
+        int remaining = g_cfgAutoOffTimeout;
+        while (remaining > 0 && !g_bStopAutoOff) {
+            std::this_thread::sleep_for(std::chrono::seconds(1));
+            remaining--;
+        }
+        if (!g_bStopAutoOff && g_bCaffeineEnabled) {
+            setCaffeineEnabled(false);
+        }
+    });
+    g_autoOffThread.detach();
+}
+
+static void stopAutoOffTimer() {
+    g_bStopAutoOff = true;
+    if (g_autoOffThread.joinable())
+        g_autoOffThread.join();
+}
+
+/* ------------------------------------------------------------------ */
+/* Toggle                                                             */
 /* ------------------------------------------------------------------ */
 static void setCaffeineEnabled(bool enabled) {
-    if (enabled == g_bCaffeineEnabled)
+    if (enabled == g_bCaffeineEnabled.load())
         return;
 
     g_bCaffeineEnabled = enabled;
 
     if (enabled) {
-        // 1. Inhibit idle notifications (Wayland protocol)
-        setIdleInhibit(true);
+        // 1. Inhibit idle notifications if screensaver inhibit is on
+        if (g_cfgInhibitScreensaver)
+            setIdleInhibit(true);
 
         // 2. Inhibit system sleep (logind D-Bus) — non-fatal
         bool sleepOk = false;
-        if (g_cfgInhibitSleep) {
+        if (g_cfgInhibitSleep)
             sleepOk = acquireSleepInhibit();
-        }
 
-        // Note: screensaver inhibition is handled by setIdleInhibit(true) above
-        // — hypridle won't receive idle notifications, preventing lock/dpms/screensaver
-
-        // 3. Auto-off timer
-        if (g_cfgAutoOffTimeout > 0) {
-            alarm(g_cfgAutoOffTimeout);
-        }
+        // 3. Auto-off timer (thread-based)
+        startAutoOffTimer();
 
         // Notification
         std::string msg = "☕ Caffeine ON";
@@ -160,8 +223,7 @@ static void setCaffeineEnabled(bool enabled) {
         HyprlandAPI::addNotification(PHANDLE, msg,
             CHyprColor{0.2, 0.9, 0.4, 1.0}, 3000);
     } else {
-        alarm(0);
-
+        stopAutoOffTimer();
         releaseSleepInhibit();
         setIdleInhibit(false);
 
@@ -169,15 +231,14 @@ static void setCaffeineEnabled(bool enabled) {
             CHyprColor{0.9, 0.6, 0.2, 1.0}, 3000);
     }
 
-    // Signal waybar to refresh
-    system("pkill -RTMIN+11 waybar 2>/dev/null");
+    signalWaybar();
 }
 
 /* ------------------------------------------------------------------ */
-/* Dispatcher handler — toggles via keybind */
+/* Dispatcher handler — toggles via keybind                           */
 /* ------------------------------------------------------------------ */
 static SDispatchResult onCaffeineDispatch(std::string args) {
-    bool enable = !g_bCaffeineEnabled;
+    bool enable = !g_bCaffeineEnabled.load();
 
     if (args == "on")
         enable = true;
@@ -189,21 +250,26 @@ static SDispatchResult onCaffeineDispatch(std::string args) {
 }
 
 /* ------------------------------------------------------------------ */
-/* hyprctl query — "hyprctl caffeine" returns JSON */
+/* hyprctl query — "hyprctl caffeine" returns JSON                    */
 /* ------------------------------------------------------------------ */
 static std::string onCaffeineQuery(eHyprCtlOutputFormat format, std::string args) {
     (void)format;
     (void)args;
-    return "{ \"enabled\": " + std::string(g_bCaffeineEnabled ? "true" : "false")
-        + ", \"sleep_inhibited\": " + std::string(g_bSleepInhibitActive ? "true" : "false")
-        + ", \"cfg_inhibit_sleep\": " + std::string(g_cfgInhibitSleep ? "true" : "false")
-        + ", \"cfg_inhibit_screensaver\": " + std::string(g_cfgInhibitScreensaver ? "true" : "false")
-        + ", \"cfg_auto_off_timeout\": " + std::to_string(g_cfgAutoOffTimeout)
-        + " }";
+
+    char buf[256];
+    snprintf(buf, sizeof(buf),
+        "{ \"enabled\": %s, \"sleep_inhibited\": %s, \"cfg_inhibit_sleep\": %s, "
+        "\"cfg_inhibit_screensaver\": %s, \"cfg_auto_off_timeout\": %d }",
+        g_bCaffeineEnabled.load() ? "true" : "false",
+        g_bSleepInhibitActive.load() ? "true" : "false",
+        g_cfgInhibitSleep ? "true" : "false",
+        g_cfgInhibitScreensaver ? "true" : "false",
+        g_cfgAutoOffTimeout);
+    return std::string(buf);
 }
 
 /* ------------------------------------------------------------------ */
-/* Plugin init / exit */
+/* Plugin init / exit                                                 */
 /* ------------------------------------------------------------------ */
 
 APICALL EXPORT PLUGIN_DESCRIPTION_INFO PLUGIN_INIT(HANDLE handle) {
@@ -231,15 +297,12 @@ APICALL EXPORT PLUGIN_DESCRIPTION_INFO PLUGIN_INIT(HANDLE handle) {
     // Register dispatcher
     HyprlandAPI::addDispatcherV2(PHANDLE, "caffeine", &onCaffeineDispatch);
 
-    // Register hyprctl command — MUST store the returned SP for proper unregister
+    // Register hyprctl command
     g_pCaffeineCmd = HyprlandAPI::registerHyprCtlCommand(PHANDLE, SHyprCtlCommand{
         .name = "caffeine",
         .exact = false,
         .fn = &onCaffeineQuery,
     });
-
-    // Set up auto-off signal handler
-    signal(SIGALRM, onAutoOffAlarm);
 
     // Read config
     static auto* const PENABLED = HyprlandAPI::getConfigValue(PHANDLE, "plugin:hyprcaffeine:enabled");
@@ -258,8 +321,11 @@ APICALL EXPORT PLUGIN_DESCRIPTION_INFO PLUGIN_INIT(HANDLE handle) {
     if (PAUTOOFF) {
         const auto val = std::any_cast<Hyprlang::INT>(PAUTOOFF->getValue());
         g_cfgAutoOffTimeout = (int)val;
+        if (g_cfgAutoOffTimeout < 0)
+            g_cfgAutoOffTimeout = 0;
     }
 
+    // Enable AFTER config is fully loaded to avoid race with auto-off timer
     if (PENABLED) {
         const auto val = std::any_cast<Hyprlang::INT>(PENABLED->getValue());
         if (val)
@@ -270,13 +336,14 @@ APICALL EXPORT PLUGIN_DESCRIPTION_INFO PLUGIN_INIT(HANDLE handle) {
         "HyprCaffeine",
         "Caffeine mode — inhibits idle, screensaver, and system sleep.",
         "Hermes Agent",
-        "2.1"
+        "2.2"
     };
 }
 
 APICALL EXPORT void PLUGIN_EXIT() {
-    alarm(0);
-    if (g_bCaffeineEnabled) {
+    stopAutoOffTimer();
+
+    if (g_bCaffeineEnabled.load()) {
         setIdleInhibit(false);
         releaseSleepInhibit();
         g_bCaffeineEnabled = false;
